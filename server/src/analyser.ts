@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import * as FuzzySearch from 'fuzzy-search'
 import * as request from 'request-promise-native'
 import * as URI from 'urijs'
+import * as url from 'url'
 import { promisify } from 'util'
 import * as LSP from 'vscode-languageserver'
 import * as Parser from 'web-tree-sitter'
@@ -59,8 +60,9 @@ export default class Analyzer {
       try {
         filePaths = await getFilePaths({ globPattern, rootPath })
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : error
         connection.window.showWarningMessage(
-          `Failed to analyze bash files using the glob "${globPattern}". The experience will be degraded. Error: ${error.message}`,
+          `Failed to analyze bash files using the glob "${globPattern}". The experience will be degraded. Error: ${errorMessage}`,
         )
       }
 
@@ -71,7 +73,7 @@ export default class Analyzer {
       )
 
       for (const filePath of filePaths) {
-        const uri = `file://${filePath}`
+        const uri = url.pathToFileURL(filePath).href
         connection.console.log(`Analyzing ${uri}`)
 
         try {
@@ -84,7 +86,8 @@ export default class Analyzer {
 
           analyzer.analyze(uri, LSP.TextDocument.create(uri, 'shell', 1, fileContent))
         } catch (error) {
-          connection.console.warn(`Failed analyzing ${uri}. Error: ${error.message}`)
+          const errorMessage = error instanceof Error ? error.message : error
+          connection.console.warn(`Failed analyzing ${uri}. Error: ${errorMessage}`)
         }
       }
 
@@ -107,11 +110,9 @@ export default class Analyzer {
 
   private treeSitterTypeToLSPKind: Kinds = {
     // These keys are using underscores as that's the naming convention in tree-sitter.
-    /* eslint-disable @typescript-eslint/camelcase */
     environment_variable_assignment: LSP.SymbolKind.Variable,
     function_definition: LSP.SymbolKind.Function,
     variable_assignment: LSP.SymbolKind.Variable,
-    /* eslint-enable @typescript-eslint/camelcase */
   }
 
   public constructor(parser: Parser) {
@@ -123,11 +124,11 @@ export default class Analyzer {
    */
   public findDefinition(name: string): LSP.Location[] {
     const symbols: LSP.SymbolInformation[] = []
-    Object.keys(this.uriToDeclarations).forEach(uri => {
+    Object.keys(this.uriToDeclarations).forEach((uri) => {
       const declarationNames = this.uriToDeclarations[uri][name] || []
-      declarationNames.forEach(d => symbols.push(d))
+      declarationNames.forEach((d) => symbols.push(d))
     })
-    return symbols.map(s => s.location)
+    return symbols.map((s) => s.location)
   }
 
   /**
@@ -175,10 +176,7 @@ export default class Analyzer {
 
     // FIXME: type the response and unit test it
     const explainshellResponse = await request({
-      uri: URI(endpoint)
-        .path('/api/explain')
-        .addQuery('cmd', cmd)
-        .toString(),
+      uri: URI(endpoint).path('/api/explain').addQuery('cmd', cmd).toString(),
       json: true,
     })
 
@@ -216,7 +214,7 @@ export default class Analyzer {
    */
   public findReferences(name: string): LSP.Location[] {
     const uris = Object.keys(this.uriToTreeSitterTrees)
-    return flattenArray(uris.map(uri => this.findOccurrences(uri, name)))
+    return flattenArray(uris.map((uri) => this.findOccurrences(uri, name)))
   }
 
   /**
@@ -229,7 +227,7 @@ export default class Analyzer {
 
     const locations: LSP.Location[] = []
 
-    TreeSitterUtil.forEach(tree.rootNode, n => {
+    TreeSitterUtil.forEach(tree.rootNode, (n) => {
       let name: null | string = null
       let range: null | LSP.Range = null
 
@@ -273,12 +271,12 @@ export default class Analyzer {
   }): LSP.SymbolInformation[] {
     const symbols: LSP.SymbolInformation[] = []
 
-    Object.keys(this.uriToDeclarations).forEach(uri => {
+    Object.keys(this.uriToDeclarations).forEach((uri) => {
       const declarationsInFile = this.uriToDeclarations[uri] || {}
-      Object.keys(declarationsInFile).map(name => {
+      Object.keys(declarationsInFile).map((name) => {
         const match = exactMatch ? name === word : name.startsWith(word)
         if (match) {
-          declarationsInFile[name].forEach(symbol => symbols.push(symbol))
+          declarationsInFile[name].forEach((symbol) => symbols.push(symbol))
         }
       })
     })
@@ -325,7 +323,10 @@ export default class Analyzer {
         const name = contents.slice(named.startIndex, named.endIndex)
         const namedDeclarations = this.uriToDeclarations[uri][name] || []
 
-        const parent = TreeSitterUtil.findParent(n, p => p.type === 'function_definition')
+        const parent = TreeSitterUtil.findParent(
+          n,
+          (p) => p.type === 'function_definition',
+        )
         const parentName =
           parent && parent.firstNamedChild
             ? contents.slice(
@@ -376,7 +377,7 @@ export default class Analyzer {
   ): Parser.SyntaxNode | null {
     const document = this.uriToTreeSitterTrees[uri]
 
-    if (!document.rootNode) {
+    if (!document?.rootNode) {
       // Check for lacking rootNode (due to failed parse?)
       return null
     }
@@ -436,9 +437,9 @@ export default class Analyzer {
     // is not a comment line
     const getComment = (l: string): null | string => {
       // this regexp has to be defined within the function
-      const commentRegExp = /^\s*#\s*(.*)/g
+      const commentRegExp = /^\s*#\s?(.*)/g
       const matches = commentRegExp.exec(l)
-      return matches ? matches[1].trim() : null
+      return matches ? matches[1].trimRight() : null
     }
 
     let currentLine = doc.getText({
@@ -449,7 +450,7 @@ export default class Analyzer {
     // iterate on every line above and including
     // the current line until getComment returns null
     let currentComment: string | null = ''
-    while ((currentComment = getComment(currentLine))) {
+    while ((currentComment = getComment(currentLine)) !== null) {
       commentBlock.push(currentComment)
       commentBlockIndex -= 1
       currentLine = doc.getText({
@@ -459,9 +460,12 @@ export default class Analyzer {
     }
 
     if (commentBlock.length) {
+      commentBlock.push('```txt')
       // since we searched from bottom up, we then reverse
       // the lines so that it reads top down.
-      return commentBlock.reverse().join('\n')
+      commentBlock.reverse()
+      commentBlock.push('```')
+      return commentBlock.join('\n')
     }
 
     // no comments found above line:
@@ -469,17 +473,19 @@ export default class Analyzer {
   }
 
   public getAllVariableSymbols(): LSP.SymbolInformation[] {
-    return this.getAllSymbols().filter(symbol => symbol.kind === LSP.SymbolKind.Variable)
+    return this.getAllSymbols().filter(
+      (symbol) => symbol.kind === LSP.SymbolKind.Variable,
+    )
   }
 
   private getAllSymbols(): LSP.SymbolInformation[] {
     // NOTE: this could be cached, it takes < 1 ms to generate for a project with 250 bash files...
     const symbols: LSP.SymbolInformation[] = []
 
-    Object.keys(this.uriToDeclarations).forEach(uri => {
-      Object.keys(this.uriToDeclarations[uri]).forEach(name => {
+    Object.keys(this.uriToDeclarations).forEach((uri) => {
+      Object.keys(this.uriToDeclarations[uri]).forEach((name) => {
         const declarationNames = this.uriToDeclarations[uri][name] || []
-        declarationNames.forEach(d => symbols.push(d))
+        declarationNames.forEach((d) => symbols.push(d))
       })
     })
 

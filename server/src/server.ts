@@ -1,5 +1,4 @@
 import * as Process from 'child_process'
-import * as path from 'path'
 import * as Path from 'path'
 import * as TurndownService from 'turndown'
 import * as LSP from 'vscode-languageserver'
@@ -9,6 +8,7 @@ import Analyzer from './analyser'
 import * as Builtins from './builtins'
 import * as config from './config'
 import Executables from './executables'
+import Linter from './linter'
 import { initializeParser } from './parser'
 import * as ReservedWords from './reservedWords'
 import { BashCompletionItem, CompletionItemDataType } from './types'
@@ -28,7 +28,7 @@ export default class BashServer {
    */
   public static async initialize(
     connection: LSP.Connection,
-    { rootPath }: LSP.InitializeParams,
+    { rootPath, capabilities }: LSP.InitializeParams,
   ): Promise<BashServer> {
     const parser = await initializeParser()
 
@@ -41,27 +41,32 @@ export default class BashServer {
     return Promise.all([
       Executables.fromPath(PATH),
       Analyzer.fromRoot({ connection, rootPath, parser }),
-    ]).then(xs => {
-      const executables = xs[0]
-      const analyzer = xs[1]
-      return new BashServer(connection, executables, analyzer)
+      new Linter({ executablePath: config.getShellcheckPath() }),
+    ]).then(([executables, analyzer, linter]) => {
+      return new BashServer(connection, executables, analyzer, linter, capabilities)
     })
   }
 
   private executables: Executables
   private analyzer: Analyzer
+  private linter: Linter
 
   private documents: LSP.TextDocuments<TextDocument> = new LSP.TextDocuments(TextDocument)
   private connection: LSP.Connection
+  private clientCapabilities: LSP.ClientCapabilities
 
   private constructor(
     connection: LSP.Connection,
     executables: Executables,
     analyzer: Analyzer,
+    linter: Linter,
+    capabilities: LSP.ClientCapabilities,
   ) {
     this.connection = connection
     this.executables = executables
     this.analyzer = analyzer
+    this.linter = linter
+    this.clientCapabilities = capabilities
   }
 
   /**
@@ -72,15 +77,28 @@ export default class BashServer {
     // The content of a text document has changed. This event is emitted
     // when the text document first opened or when its content has changed.
     this.documents.listen(this.connection)
-    this.documents.onDidChangeContent(change => {
+    this.documents.onDidChangeContent(async (change) => {
       const { uri } = change.document
-      const diagnostics = this.analyzer.analyze(uri, change.document)
+
+      // Load the tree for the modified contents into the analyzer:
+      const analyzeDiagnostics = this.analyzer.analyze(uri, change.document)
+
+      // Run shellcheck diagnostics:
+      let diagnostics: LSP.Diagnostic[] = []
+
+      const folders = this.clientCapabilities.workspace?.workspaceFolders
+        ? await connection.workspace.getWorkspaceFolders()
+        : []
+      const lintDiagnostics = await this.linter.lint(change.document, folders || [])
+      diagnostics = diagnostics.concat(lintDiagnostics)
+
+      // Treesitter's diagnostics can be a bit inaccurate, so we only merge the
+      // analyzer's diagnostics if the setting is enabled:
       if (config.getHighlightParsingError()) {
-        connection.sendDiagnostics({
-          uri: change.document.uri,
-          diagnostics,
-        })
+        diagnostics = diagnostics.concat(analyzeDiagnostics)
       }
+
+      connection.sendDiagnostics({ uri, diagnostics })
     })
 
     // Register all the handlers for the LSP events.
@@ -92,6 +110,8 @@ export default class BashServer {
     connection.onReferences(this.onReferences.bind(this))
     connection.onCompletion(this.onCompletion.bind(this))
     connection.onCompletionResolve(this.onCompletionResolve.bind(this))
+
+    // FIXME: re-lint on workspace folder change
   }
 
   /**
@@ -162,14 +182,13 @@ export default class BashServer {
 
     const commentAboveSymbol = this.analyzer.commentsAbove(symbolUri, symbolStarLine)
     const symbolDocumentation = commentAboveSymbol ? `\n\n${commentAboveSymbol}` : ''
+    const hoverHeader = `### ${symbolKindToDescription(symbol.kind)}: **${symbol.name}**`
+    const symbolLocation =
+      symbolUri !== currentUri
+        ? `in ${Path.relative(currentUri, symbolUri)}`
+        : `on line ${symbolStarLine + 1}`
 
-    return symbolUri !== currentUri
-      ? `${symbolKindToDescription(symbol.kind)} defined in ${path.relative(
-          currentUri,
-          symbolUri,
-        )}${symbolDocumentation}`
-      : `${symbolKindToDescription(symbol.kind)} defined on line ${symbolStarLine +
-          1}${symbolDocumentation}`
+    return `${hoverHeader} - *defined ${symbolLocation}*${symbolDocumentation}`
   }
 
   private getCompletionItemsForSymbols({
@@ -232,8 +251,9 @@ export default class BashServer {
           }
         }
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : error
         this.connection.console.warn(
-          `getExplainshellDocumentation exception: ${error.message}`,
+          `getExplainshellDocumentation exception: ${errorMessage}`,
         )
       }
     }
@@ -257,7 +277,7 @@ export default class BashServer {
         currentUri,
       })
         // do not return hover referencing for the current line
-        .filter(symbol => symbol.location.range.start.line !== params.position.line)
+        .filter((symbol) => symbol.location.range.start.line !== params.position.line)
         .map((symbol: LSP.SymbolInformation) =>
           this.getDocumentationForSymbol({ currentUri, symbol }),
         )
@@ -301,7 +321,7 @@ export default class BashServer {
 
     return this.analyzer
       .findOccurrences(params.textDocument.uri, word)
-      .map(n => ({ range: n.range }))
+      .map((n) => ({ range: n.range }))
   }
 
   private onReferences(params: LSP.ReferenceParams): LSP.Location[] | null {
@@ -381,7 +401,7 @@ export default class BashServer {
       return symbolCompletions
     }
 
-    const reservedWordsCompletions = ReservedWords.LIST.map(reservedWord => ({
+    const reservedWordsCompletions = ReservedWords.LIST.map((reservedWord) => ({
       label: reservedWord,
       kind: LSP.SymbolKind.Interface, // ??
       data: {
@@ -392,8 +412,8 @@ export default class BashServer {
 
     const programCompletions = this.executables
       .list()
-      .filter(executable => !Builtins.isBuiltin(executable))
-      .map(executable => {
+      .filter((executable) => !Builtins.isBuiltin(executable))
+      .map((executable) => {
         return {
           label: executable,
           kind: LSP.SymbolKind.Function,
@@ -404,7 +424,7 @@ export default class BashServer {
         }
       })
 
-    const builtinsCompletions = Builtins.LIST.map(builtin => ({
+    const builtinsCompletions = Builtins.LIST.map((builtin) => ({
       label: builtin,
       kind: LSP.SymbolKind.Interface, // ??
       data: {
@@ -413,7 +433,7 @@ export default class BashServer {
       },
     }))
 
-    const optionsCompletions = options.map(option => ({
+    const optionsCompletions = options.map((option) => ({
       label: option,
       kind: LSP.SymbolKind.Interface,
       data: {
@@ -432,7 +452,7 @@ export default class BashServer {
 
     if (word) {
       // Filter to only return suffixes of the current word
-      return allCompletions.filter(item => item.label.startsWith(word))
+      return allCompletions.filter((item) => item.label.startsWith(word))
     }
 
     return allCompletions
@@ -485,15 +505,15 @@ function deduplicateSymbols({
 
   const getSymbolId = ({ name, kind }: LSP.SymbolInformation) => `${name}${kind}`
 
-  const symbolsCurrentFile = symbols.filter(s => isCurrentFile(s))
+  const symbolsCurrentFile = symbols.filter((s) => isCurrentFile(s))
 
   const symbolsOtherFiles = symbols
-    .filter(s => !isCurrentFile(s))
+    .filter((s) => !isCurrentFile(s))
     // Remove identical symbols matching current file
     .filter(
-      symbolOtherFiles =>
+      (symbolOtherFiles) =>
         !symbolsCurrentFile.some(
-          symbolCurrentFile =>
+          (symbolCurrentFile) =>
             getSymbolId(symbolCurrentFile) === getSymbolId(symbolOtherFiles),
         ),
     )
@@ -584,6 +604,6 @@ function getCommandOptions(name: string, word: string): string[] {
   return options.stdout
     .toString()
     .split('\t')
-    .map(l => l.trim())
-    .filter(l => l.length > 0)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
 }

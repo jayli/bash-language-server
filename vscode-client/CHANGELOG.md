@@ -1,5 +1,17 @@
 # Bash IDE
 
+## 1.14.0
+
+- Upgrade language server to 3.0.3 that includes support for Shellcheck linting (please follow https://github.com/koalaman/shellcheck#installing to install Shellcheck)
+
+## 1.13.0
+
+- Upgrade language server to 2.1.0
+
+## 1.12.1
+
+- Bug fix to fix server not starting
+
 ## 1.12.0
 
 - Upgrade language server to 2.0.0

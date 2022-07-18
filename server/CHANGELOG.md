@@ -1,5 +1,36 @@
 # Bash Language Server
 
+## 3.0.5
+
+- Fix Shellcheck issue when using vim-lsp https://github.com/bash-lsp/bash-language-server/pull/443
+
+## 3.0.4
+
+- Fix Windows support for analyzer https://github.com/bash-lsp/bash-language-server/pull/433
+
+## 3.0.3
+
+- Workaround for emscripten node 18 support https://github.com/bash-lsp/bash-language-server/pull/404
+
+## 3.0.2
+
+- Fix analyzer not being called when getHighlightParsingError is off https://github.com/bash-lsp/bash-language-server/pull/396
+
+## 3.0.1
+
+- Upgrade web-tree-sitter to fix node 18 issue https://github.com/bash-lsp/bash-language-server/pull/394
+
+## 3.0.0
+
+- Linting based on shellcheck (https://github.com/bash-lsp/bash-language-server/pull/342)
+- BREAKING: Drop node 11 support (ton of dependencies upgraded).
+
+## 2.1.0
+
+- Fix failing to get options if bash-completion<=2.9 (https://github.com/bash-lsp/bash-language-server/pull/340)
+- onHover now supports for multiline code comments (https://github.com/bash-lsp/bash-language-server/pull/348)
+- Dependency upgrades
+
 ## 2.0.0
 
 - BREAKING: Drop node 10 support
